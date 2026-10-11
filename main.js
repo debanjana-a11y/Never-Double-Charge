@@ -1,12 +1,21 @@
-require('dotenv').config();
-const express = require('express');
 const path = require('path');
+// Guarantee loading .env from the project directory
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+
+const express = require('express');
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+
+// Initialize Stripe with explicit API version
 const stripe = process.env.STRIPE_SECRET_KEY
 	? require('stripe')(process.env.STRIPE_SECRET_KEY)
 	: null;
-console.log(`Stripe is ${stripe ? 'configured' : 'not configured'}.`);
+
+console.log(
+	`[INIT] Stripe status: ${
+		stripe ? 'CONFIGURED' : 'NOT CONFIGURED (Missing STRIPE_SECRET_KEY)'
+	}`,
+);
 
 const products = {
 	'pocket-30': { name: 'Pocket 30', price: 2400 },
@@ -14,6 +23,7 @@ const products = {
 	'power-100': { name: 'Power 100', price: 6800 },
 };
 
+// 1. Stripe Webhook (MUST be before express.json() to capture raw payload)
 app.post(
 	'/api/stripe/webhook',
 	express.raw({ type: 'application/json' }),
@@ -30,6 +40,7 @@ app.post(
 				process.env.STRIPE_WEBHOOK_SECRET,
 			);
 		} catch (error) {
+			console.error('[WEBHOOK ERROR]:', error.message);
 			return res.status(400).send(`Webhook Error: ${error.message}`);
 		}
 
@@ -41,9 +52,9 @@ app.post(
 			) {
 				const { RESEND_API_KEY, RESEND_FROM } = process.env;
 				if (!RESEND_API_KEY || !RESEND_FROM) {
-					return res
-						.status(503)
-						.json({ error: 'Confirmation email provider is not configured.' });
+					return res.status(503).json({
+						error: 'Confirmation email provider is not configured.',
+					});
 				}
 
 				try {
@@ -57,16 +68,23 @@ app.post(
 							from: RESEND_FROM,
 							to: [session.customer_details.email],
 							subject: 'Your Never Double Charge order is confirmed',
-							text: `Thanks for your order. Order ${session.id} is paid. Total: $${(session.amount_total / 100).toFixed(2)}. Track your order at ${process.env.APP_URL || `http://localhost:${PORT}`}/?track=${session.id}`,
+							text: `Thanks for your order. Order ${
+								session.id
+							} is paid. Total: $${(session.amount_total / 100).toFixed(
+								2,
+							)}. Track your order at ${
+								process.env.APP_URL || `http://localhost:${PORT}`
+							}/?track=${session.id}`,
 						}),
 					});
-					if (!response.ok)
+					if (!response.ok) {
 						throw new Error(`Resend returned HTTP ${response.status}`);
+					}
 				} catch (error) {
 					console.error('Confirmation email could not be sent:', error.message);
-					return res
-						.status(502)
-						.json({ error: 'Confirmation email delivery failed.' });
+					return res.status(502).json({
+						error: 'Confirmation email delivery failed.',
+					});
 				}
 			}
 		}
@@ -75,11 +93,12 @@ app.post(
 	},
 );
 
+// 2. Global JSON Body Parser & Static File Serving
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// 3. Checkout Endpoint
 app.post('/api/create-checkout-session', async (req, res) => {
-	console.log(`Stripe is ${stripe ? 'configured' : 'not configured'}.`);
 	if (!stripe) {
 		return res.status(503).json({
 			error:
@@ -127,18 +146,23 @@ app.post('/api/create-checkout-session', async (req, res) => {
 			mode: 'payment',
 			customer_email: email,
 			line_items: lineItems,
-			success_url: `${process.env.APP_URL || `${req.protocol}://${req.get('host')}`}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
-			cancel_url: `${process.env.APP_URL || `${req.protocol}://${req.get('host')}`}/?checkout=cancelled`,
+			success_url: `${
+				process.env.APP_URL || `${req.protocol}://${req.get('host')}`
+			}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+			cancel_url: `${
+				process.env.APP_URL || `${req.protocol}://${req.get('host')}`
+			}/?checkout=cancelled`,
 		});
 		res.json({ url: session.url });
 	} catch (error) {
 		console.error('Could not create Stripe checkout session:', error.message);
-		res
-			.status(502)
-			.json({ error: 'Checkout could not be started. Please try again.' });
+		res.status(502).json({
+			error: 'Checkout could not be started. Please try again.',
+		});
 	}
 });
 
+// 4. Order Tracking Endpoint
 app.get('/api/orders/:sessionId', async (req, res) => {
 	if (!stripe) {
 		return res
@@ -164,8 +188,27 @@ app.get('/api/orders/:sessionId', async (req, res) => {
 	}
 });
 
-app.listen(PORT, () => {
-	console.log(`Server is listening on http://localhost:${PORT}`);
-	// Check if the server handle is keeping the loop alive
-	console.log('Active handles:', process._getActiveHandles().length);
+// 5. Server Startup & Event-Loop Keep-Alive
+const server = app.listen(PORT, () => {
+	console.log(`Server is actively running on http://localhost:${PORT}`);
+});
+
+// Error handling to prevent silent crash on port conflict
+server.on('error', (err) => {
+	if (err.code === 'EADDRINUSE') {
+		console.error(
+			`[ERROR] Port ${PORT} is already in use. Try killing existing node tasks or change the PORT.`,
+		);
+	} else {
+		console.error('[SERVER ERROR]:', err);
+	}
+});
+
+// Explicit process guards
+process.on('uncaughtException', (err) => {
+	console.error('[UNCAUGHT EXCEPTION]:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+	console.error('[UNHANDLED REJECTION]:', reason);
 });
